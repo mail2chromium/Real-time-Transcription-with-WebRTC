@@ -1,0 +1,251 @@
+import asyncio
+import sys
+import threading
+import wave
+
+import torch
+import os
+import re
+import wave
+import numpy as np
+
+from faster_whisper import WhisperModel
+from .audio_transcriber import AppOptions, AudioTranscriber
+from .utils.audio_utils import get_valid_input_devices, base64_to_audio
+from .utils.file_utils import read_json, write_json, write_audio
+from .websoket_server import WebSocketServer
+from .openai_api import OpenAIAPI
+
+transcriber: AudioTranscriber = None
+event_loop: asyncio.AbstractEventLoop = None
+thread: threading.Thread = None
+websocket_server: WebSocketServer = None
+openai_api: OpenAIAPI = None
+
+
+def load_audio_file(file_path):
+    # Check if the file exists
+    if not os.path.exists(file_path):
+        print("No file chosen")
+        return None, None
+
+    # Set the maximum file size (10 MB in this example)
+    max_size_in_mb = 10
+    max_size_in_bytes = max_size_in_mb * 1024 * 1024
+    
+    # Get the size of the file
+    file_size = os.path.getsize(file_path)
+    if file_size > max_size_in_bytes:
+        print(f"File size must be under {max_size_in_mb}MB")
+        return None, None
+
+    # Try to open the wave file and read audio data
+    try:
+        with wave.open(file_path, 'rb') as wave_file:
+            n_channels, sampwidth, framerate, n_frames, comptype, compname = wave_file.getparams()
+            frames = wave_file.readframes(n_frames)
+            # Choose the correct dtype based on sampwidth
+            dtype = np.int16 if sampwidth == 2 else np.float32
+            audio_data = np.frombuffer(frames, dtype=dtype)
+            return audio_data, framerate
+    except wave.Error as e:
+        print(f"Error opening wave file: {e}")
+        return None, None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None, None
+
+def start_transcription(user_settings, audio_data):
+    print("Starting transcription...")
+    global transcriber, event_loop, thread, websocket_server, openai_api
+    try:
+        (
+            filtered_app_settings,
+            filtered_model_settings,
+            filtered_transcribe_settings,
+        ) = extracting_each_setting(user_settings)
+
+        whisper_model = WhisperModel(**filtered_model_settings)
+        app_settings = AppOptions(**filtered_app_settings)
+        event_loop = asyncio.new_event_loop()
+
+        if app_settings.use_websocket_server:
+            websocket_server = WebSocketServer(event_loop)
+            asyncio.run_coroutine_threadsafe(websocket_server.start_server(), event_loop)
+
+        if app_settings.use_openai_api:
+            openai_api = OpenAIAPI()
+
+        transcriber = AudioTranscriber(
+            event_loop,
+            whisper_model,
+            filtered_transcribe_settings,
+            app_settings,
+            websocket_server,
+            openai_api,
+        )
+        asyncio.set_event_loop(event_loop)
+        thread = threading.Thread(target=event_loop.run_forever, daemon=True)
+        thread.start()
+
+        # Assuming the audio data is properly formatted
+        transcriber.batch_transcribe_audio(audio_data)
+
+        if thread.is_alive():
+            event_loop.call_soon_threadsafe(event_loop.stop)
+            thread.join()
+        event_loop.close()
+    except Exception as e:
+        print(str(e))
+
+
+def stop_transcription():
+    global transcriber, event_loop, thread, websocket_server, openai_api
+    if transcriber is None:
+        print("No active transcription.")
+        return
+    asyncio.run_coroutine_threadsafe(transcriber.stop_transcription(), event_loop).result()
+
+    if websocket_server:
+        asyncio.run_coroutine_threadsafe(websocket_server.stop_server(), event_loop).result()
+
+    if thread.is_alive():
+        event_loop.call_soon_threadsafe(event_loop.stop)
+        thread.join()
+    event_loop.close()
+    transcriber = None
+    event_loop = None
+    thread = None
+    websocket_server = None
+    openai_api = None
+    print("Transcription stopped.")
+
+
+
+def get_filtered_app_settings(settings):
+    valid_keys = AppOptions.__annotations__.keys()
+    return {k: v for k, v in settings.items() if k in valid_keys}
+
+def get_filtered_model_settings(settings):
+    valid_keys = WhisperModel.__init__.__annotations__.keys()
+    return {k: v for k, v in settings.items() if k in valid_keys}
+
+def parse_number_list(number_list_str):
+    # If it matches comma-separated numbers, split and convert to float, else return as a float.
+    if ',' in number_list_str:
+        return list(map(float, number_list_str.split(',')))
+    return float(number_list_str)
+
+def parse_int_list(int_list_str):
+    # If it matches comma-separated numbers, split and convert to int, else return as a single-element list.
+    if ',' in int_list_str:
+        return list(map(int, int_list_str.split(',')))
+    return [int(int_list_str)]
+
+def get_filtered_transcribe_settings(settings):
+    valid_keys = WhisperModel.transcribe.__annotations__.keys()
+    filtered_settings = {k: v for k, v in settings.items() if k in valid_keys}
+
+    # Parse temperature if it's a string of numbers possibly separated by commas
+    if 'temperature' in filtered_settings and isinstance(filtered_settings['temperature'], str):
+        temperature_str = filtered_settings['temperature']
+        if re.match(r'^(\d*\.?\d+|((\d*\.?\d+,)+\d*\.?\d+))$', temperature_str):
+            filtered_settings['temperature'] = parse_number_list(temperature_str)
+
+    # Handle suppress_tokens correctly
+    if 'suppress_tokens' in filtered_settings:
+        suppress_tokens = filtered_settings['suppress_tokens']
+        if isinstance(suppress_tokens, str):
+            # Assuming that the string is a comma-separated list of integers
+            filtered_settings['suppress_tokens'] = list(map(int, suppress_tokens.split(',')))
+        elif isinstance(suppress_tokens, int):
+            # If it's an integer, make it a single-element list
+            filtered_settings['suppress_tokens'] = [suppress_tokens]
+        else:
+            # If it's none of the above, raise an error or handle as appropriate
+            raise ValueError("suppress_tokens must be an int or comma-separated string of ints.")
+
+    # Handle vad_filter and vad_parameters if present in the settings
+    if 'vad_filter' in settings:
+        filtered_settings['vad_filter'] = settings['vad_filter']
+    if 'vad_parameters' in settings:
+        filtered_settings['vad_parameters'] = {k: v for k, v in settings.items() if k.startswith('vad_') and k != 'vad_filter'}
+
+    return filtered_settings
+
+def extracting_each_setting(user_settings):
+    filtered_app_settings = get_filtered_app_settings(user_settings["app_settings"])
+    filtered_model_settings = get_filtered_model_settings(
+        user_settings["model_settings"]
+    )
+    filtered_transcribe_settings = get_filtered_transcribe_settings(
+        user_settings["transcribe_settings"]
+    )
+
+    write_json(
+        "settings",
+        "user_settings",
+        {
+            "app_settings": filtered_app_settings,
+            "model_settings": filtered_model_settings,
+            "transcribe_settings": filtered_transcribe_settings,
+        },
+    )
+
+    return filtered_app_settings, filtered_model_settings, filtered_transcribe_settings
+
+if __name__ == "__main__":
+    user_settings = {
+        "app_settings": {
+            "audio_device": 0,
+            "silence_limit": 8,
+            "noise_threshold": 5,
+            "non_speech_threshold": 0.1,
+            "include_non_speech": False,
+            "create_audio_file": True,
+            "use_websocket_server": False,
+            "use_openai_api": True,
+        },
+        "model_settings": {
+            "model_size_or_path": "base.en",  # Options could include different sizes or paths
+            "device":"cpu",
+            # "device": "cuda" if torch.cuda.is_available() else "cpu",  # 'auto' for automatic selection, 'cpu', or 'cuda'
+            "device_index": 0,  # This can be a single integer or a list of integers for multiple GPUs
+            "compute_type": "default",  # This could be 'int8', 'int16', 'float', depending on your compute capabilities
+            "cpu_threads": 4,  # Adjust as necessary; this might be system dependent
+            "num_workers": 1,  # Increase if running transcriptions in parallel from multiple threads
+            "download_root": None,  # Set this if you want to change the download directory
+            "local_files_only": False,  # Set to True if you want to use only locally cached models
+        },
+        "transcribe_settings": {
+            "language": "en",
+            "task": "transcribe",
+            "beam_size": 5,
+            "best_of": 5,
+            "patience": 1,
+            "length_penalty": 1,
+            "repetition_penalty": 1,
+            "no_repeat_ngram_size": 0,
+            "temperature": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            "compression_ratio_threshold": 2.4,
+            "log_prob_threshold": -1,
+            "no_speech_threshold": 0.6,
+            "condition_on_previous_text": True,
+            "initial_prompt": "",
+            "prefix": "",
+            "suppress_blank": True,
+            "suppress_tokens": -1,
+            "without_timestamps": False,
+            "max_initial_timestamp": 1,
+            "word_timestamps": False,
+            "prepend_punctuations": "'“¿([{-",
+            "append_punctuations": "'.。,, !! ?? :：”)]}、",
+        },
+    }
+    # Assuming you pass the path to the audio file as the first command line argument
+    if len(sys.argv) > 1:
+        audio_file_path = sys.argv[1]
+        audio_data, rate = load_audio_file(audio_file_path)
+        start_transcription(user_settings, audio_data)
+    else:
+        print("Please provide an audio file path.")
